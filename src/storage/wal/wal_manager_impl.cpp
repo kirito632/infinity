@@ -260,15 +260,26 @@ void WalManager::NewFlush() {
 
         LOG_TRACE(fmt::format("Attempt to write {} logs", txn_batch.size()));
 
+        // ──────────────────────────────────────────────────────────────────
+        // Phase 1: Batch serialization — serialize all entries into a single
+        //          contiguous buffer before any write() call.
+        // ──────────────────────────────────────────────────────────────────
+        struct SerializedEntry {
+            std::shared_ptr<std::string> buf;
+            TxnTimeStamp commit_ts_;
+            i32 act_size_;
+        };
+        std::vector<SerializedEntry> serialized_entries;
+        serialized_entries.reserve(txn_batch.size());
+
+        // First pass: validate transactions and calculate total serialized size
+        size_t total_size = 0;
         for (const auto &txn : txn_batch) {
             if (txn == nullptr) {
-                // terminate entry
-                LOG_INFO("Terminate WAL Manager flush thread");
-                running_ = false;
-                break;
+                // terminate entry — handled in Phase 2
+                continue;
             }
             TxnState txn_state = txn->GetTxnState();
-
             switch (txn_state) {
                 case TxnState::kCommitting: {
                     break;
@@ -278,9 +289,29 @@ void WalManager::NewFlush() {
                 }
             }
 
+            WalEntry *entry = txn->GetWALEntry();
+            if (!entry->cmds_.empty()) {
+                total_size += entry->GetSizeInBytes();
+            }
+        }
+
+        // Pre-allocate the batch buffer (reuse if large enough)
+        if (batch_buffer_.size() < total_size) {
+            batch_buffer_.resize(total_size);
+        }
+        char *write_ptr = batch_buffer_.data();
+
+        // Second pass: serialize all entries into the contiguous buffer
+        for (const auto &txn : txn_batch) {
+            if (txn == nullptr) {
+                // terminate entry
+                LOG_INFO("Terminate WAL Manager flush thread");
+                running_ = false;
+                break;
+            }
+
             // Empty WalEntry (read-only transactions) shouldn't go into WalManager.
             WalEntry *entry = txn->GetWALEntry();
-
             if (entry->cmds_.empty()) {
                 continue;
             }
@@ -297,35 +328,51 @@ void WalManager::NewFlush() {
                 LOG_TRACE(fmt::format("TXN: {}, WAL CMD: {}", entry->txn_id_, cmd->ToString()));
             }
 
+            // Serialize into the batch buffer
             i32 exp_size = entry->GetSizeInBytes();
-            std::shared_ptr<std::string> buf = std::make_shared<std::string>(exp_size, 0);
-            char *ptr = buf->data();
-            entry->WriteAdv(ptr);
-            i32 act_size = ptr - buf->data();
+            char *entry_start = write_ptr;
+            entry->WriteAdv(write_ptr);
+            i32 act_size = write_ptr - entry_start;
             if (exp_size != act_size) {
                 UnrecoverableError(fmt::format("WalManager::Flush WalEntry estimated size {} differ with the actual one {}, entry {}",
                                                exp_size,
                                                act_size,
                                                entry->ToString()));
             }
-            ofs_.write(buf->data(), ptr - buf->data());
 
-            if (InfinityContext::instance().GetServerRole() == NodeRole::kLeader) {
-                if (cluster_manager == nullptr) {
-                    cluster_manager = InfinityContext::instance().cluster_manager();
-                }
-                cluster_manager->PrepareLogs(buf);
-            }
-
-            LOG_TRACE(fmt::format("WalManager::Flush done writing wal for txn_id {}, commit_ts {}", entry->txn_id_, entry->commit_ts_));
-
-            UpdateCommitState(entry->commit_ts_, wal_size_ + act_size);
+            // Create a shared_ptr<string> for replication (PrepareLogs)
+            auto buf = std::make_shared<std::string>(entry_start, act_size);
+            serialized_entries.push_back({std::move(buf), entry->commit_ts_, act_size});
         }
 
         if (!running_.load()) {
             break;
         }
 
+        // ──────────────────────────────────────────────────────────────────
+        // Phase 2: Single write() call for all serialized entries
+        // ──────────────────────────────────────────────────────────────────
+        if (!serialized_entries.empty()) {
+            i64 total_written = write_ptr - batch_buffer_.data();
+            ofs_.write(batch_buffer_.data(), total_written);
+
+            // Per-entry replication and commit state update
+            for (const auto &se : serialized_entries) {
+                if (InfinityContext::instance().GetServerRole() == NodeRole::kLeader) {
+                    if (cluster_manager == nullptr) {
+                        cluster_manager = InfinityContext::instance().cluster_manager();
+                    }
+                    cluster_manager->PrepareLogs(se.buf);
+                }
+
+                LOG_TRACE(fmt::format("WalManager::Flush done writing wal for commit_ts {}", se.commit_ts_));
+                UpdateCommitState(se.commit_ts_, wal_size_ + se.act_size_);
+            }
+        }
+
+        // ──────────────────────────────────────────────────────────────────
+        // Phase 3: Flush (unchanged from original)
+        // ──────────────────────────────────────────────────────────────────
         switch (flush_option_) {
             case FlushOptionType::kFlushAtOnce: {
                 ofs_.flush();

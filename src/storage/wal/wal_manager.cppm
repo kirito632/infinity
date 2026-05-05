@@ -136,6 +136,9 @@ private:
     FlushOptionType flush_option_{FlushOptionType::kOnlyWrite};
     std::unique_ptr<BottomExecutor> bottom_executor_{nullptr};
 
+    // Pre-allocated buffer for batch WAL serialization (group commit optimization)
+    std::vector<char> batch_buffer_;
+
     // Flush and Checkpoint threads access following members
     mutable std::mutex mutex2_{};
     TxnTimeStamp max_commit_ts_{};
