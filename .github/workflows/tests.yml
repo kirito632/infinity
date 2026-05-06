@@ -5,6 +5,7 @@ on:
     branches:
       - 'main'
       - '*.*.*'
+      - 'feat/wal-group-commit-optimization'
     paths-ignore:
       - 'docs/**'
       - '*.md'
