@@ -104,13 +104,15 @@ void WalManager::Stop() {
         return;
     }
 
-    bottom_executor_->Stop();
-
-    // pop all the entries in the queue. and notify the condition variable.
+    // Signal the flush thread to stop and wait for it to fully drain the queue.
     new_wait_flush_.Enqueue(nullptr);
 
     LOG_TRACE("Stop the new flush thread");
     new_flush_thread_.join();
+
+    // All WAL entries in the flush thread have been submitted to the bottom executor.
+    // Now it is safe to stop the bottom executor workers.
+    bottom_executor_->Stop();
 
     LOG_TRACE("Begin to stop txn manager.");
     // Notify txn manager to stop.
@@ -251,7 +253,8 @@ void WalManager::NewFlush() {
 
     std::deque<NewTxn *> txn_batch{};
     ClusterManager *cluster_manager = nullptr;
-    while (running_.load()) {
+    bool saw_shutdown = false;
+    while (!saw_shutdown) {
         new_wait_flush_.DequeueBulk(txn_batch);
         if (txn_batch.empty()) {
             LOG_WARN("WalManager::Dequeue empty batch logs");
@@ -262,10 +265,9 @@ void WalManager::NewFlush() {
 
         for (const auto &txn : txn_batch) {
             if (txn == nullptr) {
-                // terminate entry
-                LOG_INFO("Terminate WAL Manager flush thread");
-                running_ = false;
-                break;
+                // Shutdown sentinel — drain remaining entries before exit
+                saw_shutdown = true;
+                continue;
             }
             TxnState txn_state = txn->GetTxnState();
 
@@ -322,7 +324,7 @@ void WalManager::NewFlush() {
             UpdateCommitState(entry->commit_ts_, wal_size_ + act_size);
         }
 
-        if (!running_.load()) {
+        if (saw_shutdown) {
             break;
         }
 
@@ -345,9 +347,11 @@ void WalManager::NewFlush() {
             cluster_manager->SyncLogs();
         }
 
-        // Commit bottom
+        // Commit bottom — skip shutdown sentinel
         for (const auto &txn : txn_batch) {
-            bottom_executor_->Submit(txn);
+            if (txn != nullptr) {
+                bottom_executor_->Submit(txn);
+            }
             // TODO: if txn is checkpoint, swap WAL file
         }
         txn_batch.clear();
