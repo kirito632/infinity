@@ -5,6 +5,8 @@ on:
     branches:
       - 'main'
       - '*.*.*'
+      - 'fix/**'
+      - 'feature/**'
     paths-ignore:
       - 'docs/**'
       - '*.md'
